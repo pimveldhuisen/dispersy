@@ -42,11 +42,10 @@ from collections import defaultdict, Iterable, OrderedDict
 from hashlib import sha1
 from itertools import groupby, count
 from pprint import pformat
-from socket import inet_aton
+from socket import inet_aton, socket, AF_INET, SOCK_DGRAM, error as socket_error
 from struct import unpack_from
 from time import time
 
-import netifaces
 from twisted.internet import reactor
 from twisted.internet.defer import maybeDeferred, gatherResults, inlineCallbacks, returnValue
 from twisted.internet.task import LoopingCall
@@ -134,8 +133,7 @@ class Dispersy(TaskManager):
         self._connection_type = u"unknown"
 
         # our LAN and WAN addresses
-        self._netifaces_failed = False
-        self._lan_address = self._get_lan_address(True)
+        self._lan_address = (self._get_lan_address(), 0)
         self._wan_address = ("0.0.0.0", 0)
         self._wan_address_votes = defaultdict(set)
         self._logger.debug("my LAN address is %s:%d", self._lan_address[0], self._lan_address[1])
@@ -158,110 +156,16 @@ class Dispersy(TaskManager):
         # statistics...
         self._statistics = DispersyStatistics(self)
 
-    @staticmethod
-    def _get_interface_addresses():
+    def _get_lan_address(self):
         """
-        Yields Interface instances for each available AF_INET interface found.
-
-        An Interface instance has the following properties:
-        - name          (i.e. "eth0")
-        - address       (i.e. "10.148.3.254")
-        - netmask       (i.e. "255.255.255.0")
-        - broadcast     (i.e. "10.148.3.255")
+        # Get the local ip address by connecting to a (random) internet ip
+        :return: the local ip address
         """
-        class Interface(object):
-
-            def __init__(self, name, address, netmask, broadcast):
-                self.name = name
-                self.address = address
-                self.netmask = netmask
-                self.broadcast = broadcast
-                self._l_address, = unpack_from(">L", inet_aton(address))
-                self._l_netmask, = unpack_from(">L", inet_aton(netmask))
-
-            def __contains__(self, address):
-                assert isinstance(address, str), type(address)
-                l_address, = unpack_from(">L", inet_aton(address))
-                return (l_address & self._l_netmask) == (self._l_address & self._l_netmask)
-
-            def __str__(self):
-                return "<{self.__class__.__name__} \"{self.name}\" addr:{self.address} mask:{self.netmask}>".format(self=self)
-
-            def __repr__(self):
-                return "<{self.__class__.__name__} \"{self.name}\" addr:{self.address} mask:{self.netmask}>".format(self=self)
-
-        try:
-            for interface in netifaces.interfaces():
-                try:
-                    addresses = netifaces.ifaddresses(interface)
-
-                except ValueError:
-                    # some interfaces are given that are invalid, we encountered one called ppp0
-                    pass
-
-                else:
-                    for option in addresses.get(netifaces.AF_INET, []):
-                        try:
-                            # On Windows netifaces currently returns IP addresses as unicode,
-                            # and on *nix it returns str. So, we convert any unicode objects to str.
-                            unicode_to_str = lambda s: s.encode('utf-8') if isinstance(s, unicode) else s
-                            yield Interface(interface,
-                                            unicode_to_str(option.get("addr")),
-                                            unicode_to_str(option.get("netmask")),
-                                            unicode_to_str(option.get("broadcast")))
-
-                        except TypeError:
-                            # some interfaces have no netmask configured, causing a TypeError when
-                            # trying to unpack _l_netmask
-                            pass
-        except OSError, e:
-            logger = logging.getLogger("dispersy")
-            logger.warning("failed to check network interfaces, error was: %r", e)
-
-    def _address_is_lan(self, address):
-        if self._netifaces_failed:
-            return address_is_lan_without_netifaces(address)
-        else:
-            return any(address in interface for interface in self._local_interfaces)
-
-    def _get_lan_address(self, bootstrap=False):
-        """
-        Attempt to get the newest lan ip of this machine, preferably with netifaces, but use the fallback if it fails
-        :return: lan address
-        """
-        if self._netifaces_failed:
-            return (get_lan_address_without_netifaces(), self._lan_address[1])
-        else:
-            self._local_interfaces = list(self._get_interface_addresses())
-            interface = self._guess_lan_address(self._local_interfaces)
-            return (interface.address if interface else get_lan_address_without_netifaces()), \
-                   (0 if bootstrap else self._lan_address[1])
-
-    def _guess_lan_address(self, interfaces, default=None):
-        """
-        Chooses the most likely Interface instance out of INTERFACES to use as our LAN address.
-
-        INTERFACES can be obtained from _get_interface_addresses()
-        DEFAULT is used when no appropriate Interface can be found
-        """
-        assert isinstance(interfaces, list), type(interfaces)
-        blacklist = ["127.0.0.1", "0.0.0.0", "255.255.255.255"]
-
-        # prefer interfaces where we have a broadcast address
-        for interface in interfaces:
-            if interface.broadcast and interface.address and not interface.address in blacklist:
-                self._logger.debug("%s", interface)
-                return interface
-
-        # Exception for virtual machines/containers
-        for interface in interfaces:
-            if interface.address and not interface.address in blacklist:
-                self._logger.debug("%s", interface)
-                return interface
-
-        self._logger.warning("Unable to find our public interface!")
-        self._netifaces_failed = True
-        return default
+        s = socket(AF_INET, SOCK_DGRAM)
+        s.connect(("192.0.2.0", 80)) # TEST-NET-1, guaranteed to not be connected => no callbacks
+        local_ip = s.getsockname()[0]
+        s.close()
+        return local_ip
 
     @property
     def working_directory(self):
@@ -743,6 +647,23 @@ class Dispersy(TaskManager):
                     del self._wan_address_votes[vote]
                 return vote
 
+    def address_is_lan(self, address):
+        if address == self._get_lan_address():
+            return True
+        else:
+            lan_subnets = (("192.168.0.0", 16),
+                      ("172.16.0.0", 12),
+                      ("10.0.0.0", 8))
+            return any(self.address_in_subnet(address, subnet) for subnet in lan_subnets)
+
+    def address_in_subnet(self, address, subnet):
+        address = unpack_from(">L", inet_aton(address))[0]
+        (subnet_main, netmask) = subnet
+        subnet_main = unpack_from(">L", inet_aton(subnet_main))[0]
+        address >>= 32-netmask
+        subnet_main >>= 32-netmask
+        return address == subnet_main
+
     def wan_address_vote(self, address, voter):
         """
         Add one vote and possibly re-determine our wan address.
@@ -805,8 +726,7 @@ class Dispersy(TaskManager):
 
         # ignore votes from voters that we know are within any of our LAN interfaces.  these voters
         # can not know our WAN address
-
-        if self._address_is_lan(voter.sock_addr[0]):
+        if self.address_is_lan(voter.sock_addr[0]):
             self._logger.debug("ignore vote for %s from %s (voter is within our LAN)", address, voter.sock_addr)
             return
 
@@ -1648,7 +1568,7 @@ ORDER BY global_time""", (meta.database_id, member_database_id)))
         """
         assert is_valid_address(sock_addr), sock_addr
 
-        if self._address_is_lan(sock_addr[0]):
+        if self.address_is_lan(sock_addr[0]):
             # is SOCK_ADDR is on our local LAN, hence LAN_ADDRESS should be SOCK_ADDR
             if sock_addr != lan_address:
                 self._logger.debug("estimate someones LAN address is %s (LAN was %s, WAN stays %s)",
