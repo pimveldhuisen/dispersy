@@ -244,13 +244,13 @@ class Dispersy(TaskManager):
         for interface in interfaces:
             if interface.broadcast and interface.address and not interface.address in blacklist:
                 self._logger.debug("%s", interface)
-          #      return interface
+                return interface
 
         # Exception for virtual machines/containers
         for interface in interfaces:
             if interface.address and not interface.address in blacklist:
                 self._logger.debug("%s", interface)
-          #      return interface
+                return interface
 
         self._logger.error("Unable to find our public interface!")
         self._netifaces_failed = True
