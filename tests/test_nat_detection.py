@@ -111,6 +111,20 @@ class TestNATDetection(DispersyTestFunc):
 
 class TestAddressEstimation(DispersyTestFunc):
 
+    def test_address_in_lan_function(self):
+        # Positive cases:
+        assert self._dispersy.address_is_lan("192.168.1.5")
+        assert self._dispersy.address_is_lan("10.42.42.42")
+        assert self._dispersy.address_is_lan("192.168.0.7")
+        assert self._dispersy.address_is_lan("172.31.255.255")
+        #Negative cases:
+        self.assertFalse(self._dispersy.address_is_lan("192.169.1.5"))
+        self.assertFalse(self._dispersy.address_is_lan("11.42.42.42"))
+        self.assertFalse(self._dispersy.address_is_lan("192.0.0.7"))
+        self.assertFalse(self._dispersy.address_is_lan("172.32.0.0"))
+        self.assertFalse(self._dispersy.address_is_lan("123.123.123.123"))
+        self.assertFalse(self._dispersy.address_is_lan("42.42.42.42"))
+
     def test_estimate_addresses_within_LAN(self):
         """
         Tests the estimate_lan_and_wan_addresses method while NODE and OTHER are within the same LAN.
