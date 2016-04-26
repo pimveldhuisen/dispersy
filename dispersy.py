@@ -42,7 +42,7 @@ from collections import defaultdict, Iterable, OrderedDict
 from hashlib import sha1
 from itertools import groupby, count
 from pprint import pformat
-from socket import inet_aton, socket, AF_INET, SOCK_DGRAM
+from socket import inet_aton
 from struct import unpack_from
 from time import time
 
@@ -69,7 +69,8 @@ from .message import (Message, DropMessage, DelayMessageBySequence,
                       DropPacket, DelayPacket)
 from .statistics import DispersyStatistics, _runtime_statistics
 from .taskmanager import TaskManager
-from .util import attach_runtime_statistics, init_instrumentation, blocking_call_on_reactor_thread, is_valid_address
+from .util import (attach_runtime_statistics, init_instrumentation, blocking_call_on_reactor_thread, is_valid_address,
+                   get_lan_address_without_netifaces, address_is_lan_without_netifaces)
 
 
 # Set up the instrumentation utilities
@@ -134,9 +135,7 @@ class Dispersy(TaskManager):
 
         # our LAN and WAN addresses
         self._netifaces_failed = False
-        self._local_interfaces = list(self._get_interface_addresses())
-        interface = self._guess_lan_address(self._local_interfaces)
-        self._lan_address = ((interface.address if interface else self._get_lan_address_without_netifaces()), 0)
+        self._lan_address = self._get_lan_address()
         self._wan_address = ("0.0.0.0", 0)
         self._wan_address_votes = defaultdict(set)
         self._logger.debug("my LAN address is %s:%d", self._lan_address[0], self._lan_address[1])
@@ -158,17 +157,6 @@ class Dispersy(TaskManager):
 
         # statistics...
         self._statistics = DispersyStatistics(self)
-
-    def _get_lan_address_without_netifaces(self):
-        """
-        # Get the local ip address by connecting to a (random) internet ip
-        :return: the local ip address
-        """
-        s = socket(AF_INET, SOCK_DGRAM)
-        s.connect(("192.0.2.0", 80)) # TEST-NET-1, guaranteed to not be connected => no callbacks
-        local_ip = s.getsockname()[0]
-        s.close()
-        return local_ip
 
     @staticmethod
     def _get_interface_addresses():
@@ -224,6 +212,24 @@ class Dispersy(TaskManager):
             logger = logging.getLogger("dispersy")
             logger.exception("failed to check network interfaces, error was: %r", e)
 
+    def _address_is_lan(self, address):
+        if self._netifaces_failed:
+            return address_is_lan_without_netifaces(address)
+        else:
+            return any(address in interface for interface in self._local_interfaces)
+
+    def _get_lan_address(self):
+        """
+        Attempt to get the newest lan ip of this machine, preferably with netifaces, but use the fallback if it fails
+        :return: lan address
+        """
+        if self._netifaces_failed:
+            return get_lan_address_without_netifaces()
+        else:
+            self._local_interfaces = list(self._get_interface_addresses())
+            interface = self._guess_lan_address(self._local_interfaces)
+            return (interface.address if interface else get_lan_address_without_netifaces()), 0
+
     def _guess_lan_address(self, interfaces, default=None):
         """
         Chooses the most likely Interface instance out of INTERFACES to use as our LAN address.
@@ -238,13 +244,13 @@ class Dispersy(TaskManager):
         for interface in interfaces:
             if interface.broadcast and interface.address and not interface.address in blacklist:
                 self._logger.debug("%s", interface)
-                return interface
+          #      return interface
 
         # Exception for virtual machines/containers
         for interface in interfaces:
             if interface.address and not interface.address in blacklist:
                 self._logger.debug("%s", interface)
-                return interface
+          #      return interface
 
         self._logger.error("Unable to find our public interface!")
         self._netifaces_failed = True
@@ -716,23 +722,6 @@ class Dispersy(TaskManager):
         else:
             return self.convert_packet_to_message(str(packet), community)
 
-    def address_is_lan(self, address):
-        if address == self._get_lan_address_without_netifaces():
-            return True
-        else:
-            lan_subnets = (("192.168.0.0", 16),
-                      ("172.16.0.0", 12),
-                      ("10.0.0.0", 8))
-            return any(self.address_in_subnet(address, subnet) for subnet in lan_subnets)
-
-    def address_in_subnet(self, address, subnet):
-        address = unpack_from(">L", inet_aton(address))[0]
-        (subnet_main, netmask) = subnet
-        subnet_main = unpack_from(">L", inet_aton(subnet_main))[0]
-        address >>= 32-netmask
-        subnet_main >>= 32-netmask
-        return address == subnet_main
-
     def wan_address_unvote(self, voter):
         """
         Removes and returns one vote made by VOTER.
@@ -807,12 +796,8 @@ class Dispersy(TaskManager):
 
         # ignore votes from voters that we know are within any of our LAN interfaces.  these voters
         # can not know our WAN address
-        if self._netifaces_failed:
-            vote_from_lan = self.address_is_lan(voter.sock_addr[0])
-        else:
-            vote_from_lan = any(voter.sock_addr[0] in interface for interface in self._local_interfaces)
 
-        if vote_from_lan:
+        if self._address_is_lan(voter.sock_addr[0]):
             self._logger.debug("ignore vote for %s from %s (voter is within our LAN)", address, voter.sock_addr)
             return
 
@@ -829,12 +814,7 @@ class Dispersy(TaskManager):
         if len(self._wan_address_votes[address]) > len(self._wan_address_votes.get(self._wan_address, ())):
             if set_wan_address(address):
                 # refresh our LAN address(es), perhaps we are running on a roaming device
-                if self._netifaces_failed:
-                    lan_address = self._get_lan_address()
-                else:
-                    self._local_interfaces = list(self._get_interface_addresses())
-                    interface = self._guess_lan_address(self._local_interfaces)
-                    lan_address = ((interface.address if interface else "0.0.0.0"), self._lan_address[1])
+                lan_address = self._get_lan_address()
                 if not is_valid_address(lan_address):
                     lan_address = (self._wan_address[0], self._lan_address[1])
                 set_lan_address(lan_address)
@@ -1659,12 +1639,7 @@ ORDER BY global_time""", (meta.database_id, member_database_id)))
         """
         assert is_valid_address(sock_addr), sock_addr
 
-        if self._netifaces_failed:
-            message_from_lan = self.address_is_lan(sock_addr[0])
-        else:
-            message_from_lan = any(sock_addr[0] in interface for interface in self._local_interfaces)
-
-        if message_from_lan:
+        if self._address_is_lan(sock_addr[0]):
             # is SOCK_ADDR is on our local LAN, hence LAN_ADDRESS should be SOCK_ADDR
             if sock_addr != lan_address:
                 self._logger.debug("estimate someones LAN address is %s (LAN was %s, WAN stays %s)",
