@@ -11,11 +11,15 @@ import os
 sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'libnacl'))
 
 import libnacl.dual
+from libnacl import crypto_box_SECRETKEYBYTES, crypto_sign_SEEDBYTES
 
 from .util import attach_runtime_statistics
 from libnacl.encode import hex_encode
 
 _STRUCT_L = Struct(">L")
+
+BINARYKEY_NUMER_OF_BYTES = crypto_box_SECRETKEYBYTES
+SEED_NUMBER_OF_BYTES = crypto_sign_SEEDBYTES
 
 # Allow all available curves.
 # Niels: 16-12-2013, if it starts with NID_
@@ -402,9 +406,13 @@ class LibNaCLPK(DispersyKey):
 
 class LibNaCLSK(LibNaCLPK):
 
-    def __init__(self, binarykey=""):
+    def __init__(self, binarykey="", seed=None):
         if binarykey:
-            crypt, seed = binarykey[:libnacl.crypto_box_SECRETKEYBYTES], binarykey[libnacl.crypto_box_SECRETKEYBYTES : libnacl.crypto_box_SECRETKEYBYTES + libnacl.crypto_sign_SEEDBYTES]
+            crypt = binarykey[:libnacl.crypto_box_SECRETKEYBYTES]
+            if seed:
+                seed = seed
+            else:
+                seed = binarykey[libnacl.crypto_box_SECRETKEYBYTES : libnacl.crypto_box_SECRETKEYBYTES + libnacl.crypto_sign_SEEDBYTES]
             self.key = libnacl.dual.DualSecret(crypt, seed)
         else:
             self.key = libnacl.dual.DualSecret()
